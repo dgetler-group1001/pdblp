@@ -2,3 +2,7 @@
 pdblp.egg-info
 doc/_build/
 dist/
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/pdblp.iml
+.idea/vcs.xml
+.idea/modules.xml
