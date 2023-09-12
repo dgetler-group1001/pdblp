@@ -1,5 +1,9 @@
+import os
 import logging
 import contextlib
+import pickle
+from typing import Union
+from datetime import datetime
 
 import blpapi
 import numpy as np
@@ -56,7 +60,7 @@ def bopen(**kwargs):
 
 class BCon(object):
     def __init__(self, host='localhost', port=8194, debug=False, timeout=500,
-                 session=None, identity=None):
+                 session=None, identity=None, cache_path='c:/bbcache/'):
         """
         Create an object which manages connection to the Bloomberg API session
 
@@ -98,6 +102,8 @@ class BCon(object):
         self._identity = identity
         # initialize logger
         self.debug = debug
+        self._cache_path = cache_path
+        self._cache_file = f'{self._cache_path}record.bbcache'
 
     @property
     def debug(self):
@@ -185,6 +191,56 @@ class BCon(object):
 
         return self
 
+    @staticmethod
+    def __random_filename(n: int = 24):
+        return ''.join([chr(i) for i in np.random.randint(97, 122, n)] + ['.', 'b', 'b', 'c', 'a', 'c', 'h', 'e'])
+
+    @staticmethod
+    def __cache_record(rtype, tickers, flds, ovrds, setvals) -> str:
+        record_text = f'{rtype};'
+        record_text += ' '.join(tickers)
+        record_text += ';'
+        record_text += ' '.join(flds)
+        record_text += ';'
+        for i in ovrds:
+            record_text += ' '.join(str(i))
+            record_text += ';'
+        for i in setvals:
+            record_text += ''.join(str(i))
+
+        return record_text
+
+    def _check_cache(self, rtype, tickers, flds, ovrds, setvals, use_cache=True) -> Union[None, pd.DataFrame]:
+        if not use_cache:
+            return None
+
+        cache_record = self.__cache_record(rtype, tickers, flds, ovrds, setvals)
+        if os.path.exists(self._cache_file):
+            cache_records = pd.read_pickle(self._cache_file)
+            cache_exists = cache_records['record_text'].eq(cache_record)
+            if sum(cache_exists) > 0:
+                filename = cache_records[cache_exists].filename.iloc[0]
+                cached_data = pd.read_pickle(f'{self._cache_path}{filename}')
+            else:
+                cached_data = None
+        else:
+            cached_data = None
+        return cached_data
+
+    def _create_cache(self, data: pd.DataFrame, cache_record: str):
+        if os.path.exists(self._cache_file):
+            cache_records = pd.read_pickle(self._cache_file)
+        else:
+            cache_records = pd.DataFrame()
+        filename = self.__random_filename()
+        new_record = pd.DataFrame({
+            'record_text': cache_record,
+            'filename': filename,
+        }, index=[0])
+        cache_records = pd.concat([cache_records, new_record])
+        cache_records.to_pickle(self._cache_file)
+        data.to_pickle(f'{self._cache_path}{filename}')
+
     def _create_req(self, rtype, tickers, flds, ovrds, setvals):
         # flush event queue in case previous call errored out
         while(self._session.tryNextEvent()):
@@ -203,6 +259,24 @@ class BCon(object):
             ovrd = overrides.appendElement()
             ovrd.setElement('fieldId', ovrd_fld)
             ovrd.setElement('value', ovrd_val)
+
+        return request
+
+    def _create_eqs_req(self, screen_name, as_of_date):
+        # flush event queue in case previous call errored out
+        while(self._session.tryNextEvent()):
+            pass
+
+        request = self.refDataService.createRequest('BeqsRequest')
+        request.set('screenName', screen_name)
+        request.set('screenType', 'PRIVATE')
+        request.set('Group', 'General')
+        request.set('languageId', 'ENGLISH')
+
+        overrides = request.getElement('overrides')
+        ovrd = overrides.appendElement()
+        ovrd.setElement('fieldId', 'PiTDate')
+        ovrd.setElement('value', as_of_date)
 
         return request
 
@@ -237,8 +311,30 @@ class BCon(object):
                     raise RuntimeError('Unexpected Event Type: {!r}'
                                        .format(ev_name))
 
+    def eqs(self, screen_name, as_of_date, use_cache=True):
+        logger = _get_logger(self.debug)
+
+        data = None
+        if use_cache:
+            data = self._check_cache('BeqsRequest', [], [screen_name], [], [('as_of_date', as_of_date)])
+
+        if data is None:
+            request = self._create_eqs_req(screen_name, as_of_date)
+            logger.info('Sending Request:\n{}'.format(request))
+            self._session.sendRequest(request, identity=self._identity)
+            data = []
+            for msg in self._receive_events(1):
+                data.append(msg)
+            data = pd.DataFrame([
+                i['securityData']['fieldData']['fieldData'] for i in msg['element']['BeqsResponse']['data']['securityData']
+            ])
+            record = self.__cache_record('BeqsRequest', [], [screen_name], [], [('as_of_date', as_of_date)])
+            self._create_cache(data, record)
+
+        return data
+
     def bdh(self, tickers, flds, start_date, end_date, elms=None,
-            ovrds=None, longdata=False):
+            ovrds=None, longdata=False, use_cache=True):
         """
         Get tickers and fields, return pandas DataFrame with columns as
         MultiIndex with levels "ticker" and "field" and indexed by "date".
@@ -271,11 +367,15 @@ class BCon(object):
 
         elms = list(elms)
 
-        data = self._bdh_list(tickers, flds, start_date, end_date,
-                              elms, ovrds)
+        data, cache = self._bdh_list(tickers, flds, start_date, end_date, elms, ovrds, use_cache)
 
-        df = pd.DataFrame(data, columns=['date', 'ticker', 'field', 'value'])
-        df.loc[:, 'date'] = pd.to_datetime(df.loc[:, 'date'])
+        if cache is not None:
+            df = pd.DataFrame(data, columns=['date', 'ticker', 'field', 'value'])
+            df['date'] = pd.to_datetime(df['date'])
+            self._create_cache(df, cache)
+        else:
+            df = data
+
         if not longdata:
             cols = ['ticker', 'field']
             df = df.set_index(['date'] + cols).unstack(cols)
@@ -284,7 +384,7 @@ class BCon(object):
         return df
 
     def _bdh_list(self, tickers, flds, start_date, end_date, elms,
-                  ovrds):
+                  ovrds, use_cache=True):
         logger = _get_logger(self.debug)
         if type(tickers) is not list:
             tickers = [tickers]
@@ -295,31 +395,39 @@ class BCon(object):
         setvals.append(('startDate', start_date))
         setvals.append(('endDate', end_date))
 
-        request = self._create_req('HistoricalDataRequest', tickers, flds,
-                                   ovrds, setvals)
-        logger.info('Sending Request:\n{}'.format(request))
-        # Send the request
-        self._session.sendRequest(request, identity=self._identity)
-        data = []
-        # Process received events
-        for msg in self._receive_events():
-            d = msg['element']['HistoricalDataResponse']
-            has_security_error = 'securityError' in d['securityData']
-            has_field_exception = len(d['securityData']['fieldExceptions']) > 0
-            if has_security_error or has_field_exception:
-                raise ValueError(d)
-            ticker = d['securityData']['security']
-            fldDatas = d['securityData']['fieldData']
-            for fd in fldDatas:
-                for fname, value in fd['fieldData'].items():
-                    if fname == 'date':
-                        continue
-                    data.append(
-                        (fd['fieldData']['date'], ticker, fname, value)
-                    )
-        return data
+        request_type = 'HistoricalDataRequest'
 
-    def ref(self, tickers, flds, ovrds=None):
+        data = self._check_cache(request_type, tickers, flds, ovrds, setvals, use_cache)
+        cache_record = None
+        if data is None:
+            cache_record = self.__cache_record(request_type, tickers, flds, ovrds, setvals)
+            request = self._create_req(request_type, tickers, flds,
+                                       ovrds, setvals)
+            logger.info('Sending Request:\n{}'.format(request))
+            # Send the request
+            self._session.sendRequest(request, identity=self._identity)
+            data = []
+            # Process received events
+            for msg in self._receive_events():
+                d = msg['element']['HistoricalDataResponse']
+                has_security_error = 'securityError' in d['securityData']
+                has_field_exception = len(d['securityData']['fieldExceptions']) > 0
+                if has_security_error:
+                    raise ValueError(d['securityData'])
+                if has_field_exception:
+                    raise ValueError(d['securityData']['fieldExceptions'])
+                ticker = d['securityData']['security']
+                fldDatas = d['securityData']['fieldData']
+                for fd in fldDatas:
+                    for fname, value in fd['fieldData'].items():
+                        if fname == 'date':
+                            continue
+                        data.append(
+                            (fd['fieldData']['date'], ticker, fname, value)
+                        )
+        return data, cache_record
+
+    def ref(self, tickers, flds, ovrds=None, use_cache=True):
         """
         Make a reference data request, get tickers and fields, return long
         pandas DataFrame with columns [ticker, field, value]
@@ -357,13 +465,24 @@ class BCon(object):
             tickers = [tickers]
         if type(flds) is not list:
             flds = [flds]
-        request = self._create_req('ReferenceDataRequest', tickers, flds,
-                                   ovrds, [])
-        logger.info('Sending Request:\n{}'.format(request))
-        self._session.sendRequest(request, identity=self._identity)
-        data = self._parse_ref(flds)
-        data = pd.DataFrame(data)
-        data.columns = ['ticker', 'field', 'value']
+
+        logger.info('Checking for cached data')
+        if use_cache:
+            cache_date = []
+        else:
+            cache_date = [('endDate', datetime.today())]
+        data = self._check_cache('ReferenceDataRequest', tickers, flds, ovrds, cache_date, use_cache)
+        if data is None:
+            request = self._create_req('ReferenceDataRequest', tickers, flds,
+                                       ovrds, [])
+            logger.info('Sending Request:\n{}'.format(request))
+            self._session.sendRequest(request, identity=self._identity)
+            data = self._parse_ref(flds)
+            data = pd.DataFrame(data)
+            data.columns = ['ticker', 'field', 'value']
+            logger.info('Cacheing data')
+            cache_record = self.__cache_record('ReferenceDataRequest', tickers, flds, ovrds, [])
+            self._create_cache(data, cache_record)
         return data
 
     def _parse_ref(self, flds, keep_corrId=False, sent_events=1):
@@ -405,7 +524,7 @@ class BCon(object):
                         data.append(datum)
         return data
 
-    def bulkref(self, tickers, flds, ovrds=None):
+    def bulkref(self, tickers, flds, ovrds=None, use_cache=True):
         """
         Make a bulk reference data request, get tickers and fields, return long
         pandas DataFrame with columns [ticker, field, name, value, position].
@@ -459,13 +578,23 @@ class BCon(object):
         if type(flds) is not list:
             flds = [flds]
         setvals = []
-        request = self._create_req('ReferenceDataRequest', tickers, flds,
-                                   ovrds, setvals)
-        logger.info('Sending Request:\n{}'.format(request))
-        self._session.sendRequest(request, identity=self._identity)
-        data = self._parse_bulkref(flds)
-        data = pd.DataFrame(data)
-        data.columns = ['ticker', 'field', 'name', 'value', 'position']
+        logger.info('Checking for cached data')
+        if use_cache:
+            cache_date = []
+        else:
+            cache_date = [('endDate', datetime.today())]
+        data = self._check_cache('ReferenceDataRequest', tickers, flds, ovrds, cache_date, use_cache)
+        if data is None:
+            request = self._create_req('ReferenceDataRequest', tickers, flds,
+                                       ovrds, setvals)
+            logger.info('Sending Request:\n{}'.format(request))
+            self._session.sendRequest(request, identity=self._identity)
+            data = self._parse_bulkref(flds)
+            data = pd.DataFrame(data)
+            data.columns = ['ticker', 'field', 'name', 'value', 'position']
+            logger.info('Cacheing data')
+            cache_record = self.__cache_record('ReferenceDataRequest', tickers, flds, ovrds, [])
+            self._create_cache(data, cache_record)
         return data
 
     def _parse_bulkref(self, flds, keep_corrId=False, sent_events=1):
@@ -627,7 +756,7 @@ class BCon(object):
             self._session.sendRequest(request, identity=self._identity,
                                       correlationId=cid)
 
-    def bdib(self, ticker, start_datetime, end_datetime, event_type, interval,
+    def bdib(self, ticker, flds, start_datetime, end_datetime, event_type, interval,
              elms=None):
         """
         Get Open, High, Low, Close, Volume, and numEvents for a ticker.
@@ -637,6 +766,7 @@ class BCon(object):
         ----------
         ticker: string
             String corresponding to ticker
+        flds: list
         start_datetime: string
             UTC datetime in format YYYY-mm-ddTHH:MM:SS
         end_datetime: string
@@ -668,17 +798,36 @@ class BCon(object):
         for name, val in elms:
             request.set(name, val)
 
-        logger.info('Sending Request:\n{}'.format(request))
-        # Send the request
-        self._session.sendRequest(request, identity=self._identity)
-        # Process received events
-        data = []
-        flds = ['open', 'high', 'low', 'close', 'volume', 'numEvents']
-        for msg in self._receive_events():
-            d = msg['element']['IntradayBarResponse']
-            for bar in d['barData']['barTickData']:
-                data.append(bar['barTickData'])
-        data = pd.DataFrame(data).set_index('time').sort_index().loc[:, flds]
+        data = self._check_cache(
+            'IntradayBarRequest',
+            [ticker],
+            flds,
+            elms,
+            setvals=[
+                ('eventType', event_type),
+                ('interval', interval),
+                ('startDate', start_datetime),
+                ('endDate', end_datetime)
+            ]
+        )
+        cache_record = None
+
+        if data is None:
+            logger.info('Sending Request:\n{}'.format(request))
+            # Send the request
+            self._session.sendRequest(request, identity=self._identity)
+            # Process received events
+            data = []
+            # flds = ['open', 'high', 'low', 'close', 'volume', 'numEvents']
+            for msg in self._receive_events():
+                d = msg['element']['IntradayBarResponse']
+                for bar in d['barData']['barTickData']:
+                    data.append(bar['barTickData'])
+            if len(data) > 0:
+                data = pd.DataFrame(data).set_index('time').sort_index().loc[:, flds]
+            else:
+                data = pd.DataFrame(columns=flds)
+
         return data
 
     def bsrch(self, domain):
@@ -734,7 +883,7 @@ def _element_to_dict(elem):
         else:
             try:
                 value = elem.getValue()
-            except:  # NOQA
+            except:
                 value = None
         return value
 
